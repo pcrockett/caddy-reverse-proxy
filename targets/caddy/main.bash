@@ -1,7 +1,7 @@
 #!/usr/bin/env blarg
 
 targets=(
-  user-created
+  service-enabled
 )
 
 depends_on "${targets[@]}"

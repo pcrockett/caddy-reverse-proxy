@@ -1,7 +1,7 @@
 #!/usr/bin/env blarg
 
 targets=(
-  TODO
+  caddy/main
 )
 
 depends_on "${targets[@]}"

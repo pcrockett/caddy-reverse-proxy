@@ -1,0 +1,783 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+# blarg re-execs itself as a new Python process for every target, so import
+# time is paid once per target: keep top-level imports lean and import the rest
+# lazily where they're used.
+import os
+import sys
+
+VERSION = "0.7.3"
+
+
+STDLIB = """
+#!/usr/bin/env bash
+
+BLARG_TARGET_DEPENDENCIES=()
+
+panic() {
+    echo "FATAL: ${*}" >&2
+    exit 1
+}
+
+log_verbose() {
+    if [ "${BLARG_VERBOSE+x}" == "x" ]; then
+        echo "${*}"
+    fi
+}
+
+is_dry_run() {
+    test "${BLARG_DRY_RUN+x}" == "x"
+}
+
+depends_on() {
+    # this command may not be used in the user's target script, so we could get
+    # a shellcheck "command unreachable" error here _sometimes_.
+    #
+    # shellcheck disable=SC2317
+    BLARG_TARGET_DEPENDENCIES+=("$@")
+}
+
+is_external_module_target() {
+    [[ "${1}" =~ ^@([a-zA-Z0-9_-]+):(.+)$ ]]
+}
+
+get_module_dir() {
+    local script_basename="${1}" module_name module_env
+    if is_external_module_target "${script_basename}"; then
+        module_name="${BASH_REMATCH[1]}"
+        module_env="BLARG_MODULE_${module_name}"
+        echo "${!module_env}"
+    else
+        echo "${BLARG_MODULE_DIR}"
+    fi
+}
+
+find_target() {
+    local script_basename="${1}"
+    local module_name module_env this_dir full_target_path search_dirs script_basename dir
+
+    if is_external_module_target "${script_basename}"; then
+        module_name="${BASH_REMATCH[1]}"
+        script_basename="${BASH_REMATCH[2]}"
+        module_env="BLARG_MODULE_${module_name}"
+        if [ "${!module_env:-}" == "" ]; then
+            search_dirs=()
+        else
+            search_dirs=("${!module_env}/targets")
+        fi
+    else
+        this_dir="$(dirname "${BLARG_TARGET_PATH}")" || panic "unable to get directory name"
+        search_dirs=(
+            "${this_dir}"
+            "${BLARG_TARGETS_DIR}"
+        )
+    fi
+
+    for dir in "${search_dirs[@]}"; do
+        full_target_path="${dir}/${script_basename}.bash"
+        if [ -f "${full_target_path}" ]; then
+            echo "${full_target_path}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+satisfy() {
+    local full_target_path script_basename module_dir target_result final_result
+
+    final_result=0
+    for script_basename in "$@"; do
+
+        full_target_path="$(find_target "${script_basename}")" \\
+            || panic "Target does not exist: ${script_basename}"
+
+        module_dir="$(get_module_dir "${script_basename}")"
+        BLARG_MODULE_DIR="${module_dir}" \\
+            BLARG_TARGETS_DIR="${module_dir}/targets" \\
+            "${full_target_path}"
+
+        target_result=$?
+        if [ ${target_result} -ne 0 ]; then
+            if is_dry_run; then
+                # `target_result` tells us that the target needs to run `apply`
+                # we're going to keep iterating through dependencies, but ultimately
+                # return 1.
+                final_result=1
+            else
+                # `target_result` tells us that the target `apply` failed
+                # it's time to bail.
+                return ${target_result}
+            fi
+        fi
+    done
+    return ${final_result}
+}
+"""
+
+
+BASE = """
+# shellcheck disable=SC2329  # will be called dynamically
+satisfied_if() {
+    # this command will normally be unreachable; the user's `satisfied_if`
+    # implementation will very often override this one.
+    #
+    # shellcheck disable=SC2317
+    false
+}
+
+"""
+
+
+EXECUTOR = """
+__BLARG_MAIN__() {
+    local final_result=0
+    if [ ${#BLARG_TARGET_DEPENDENCIES[@]} -gt 0 ]; then
+        log_verbose "${BLARG_INDENT}${BLARG_TARGET_NAME} [dependencies...]"
+        satisfy "${BLARG_TARGET_DEPENDENCIES[@]}"
+        satisfy_result=$?
+        if [ ${satisfy_result} -ne 0 ]; then
+            if is_dry_run; then
+                # `satisfy_result` tells us that a dependency needs an `apply`
+                # we'll keep iterating through dependencies, but we know right now
+                # that we'll be returning an exit code of 1.
+                final_result=1
+            else
+                # `satisfy_result` tells us that a dependency's `apply` failed.
+                # time to bail.
+                return ${satisfy_result}
+            fi
+        fi
+    fi
+
+    log_verbose "${BLARG_INDENT}${BLARG_TARGET_NAME} [running...]"
+    (
+        set -Eeuo pipefail
+        satisfied_if &> /dev/null
+    )
+    satisfied_if_result=$?
+
+    if [ ${satisfied_if_result} -eq 0 ]; then
+        log_verbose "${BLARG_INDENT}${BLARG_TARGET_NAME} [already satisfied]"
+        return ${final_result}
+    fi
+
+    if is_dry_run; then
+        if [ "$(type -t apply)" == "function" ]; then
+            echo "dry-run: would apply ${BLARG_TARGET_NAME}"
+            return 1
+        else
+            return ${final_result}
+        fi
+    elif [ "$(type -t apply)" == "function" ]; then
+        (
+            set -Eeuo pipefail
+            apply
+        )
+        apply_result=$?
+        test ${apply_result} -eq 0 || panic "${BLARG_TARGET_NAME}.apply() returned with code ${apply_result}."
+    fi
+
+    log_verbose "${BLARG_INDENT}${BLARG_TARGET_NAME} [done]"
+    return ${final_result}
+}
+
+__BLARG_MAIN__
+"""
+
+
+class CliArgs:
+    def __init__(
+        self,
+        script_path: str | None,
+        dump_src: bool,
+        version: bool,
+        verbose: bool,
+        dry_run: bool,
+        ssh: str | None = None,
+    ):
+        self.script_path = script_path
+        self.dump_src = dump_src
+        self.version = version
+        self.verbose = verbose
+        self.dry_run = dry_run
+        self.ssh = ssh
+
+
+HELP = """usage: blarg [-h] [--dump-src] [--version] [--verbose] [--dry-run] [--ssh SSH_TARGET] [script_path]
+
+Execute bash target files <https://github.com/pcrockett/blarg>
+
+positional arguments:
+  script_path        script file to execute
+
+options:
+  -h, --help         show this help message and exit
+  --dump-src, -d     output the full source that would be executed by Bash instead of running
+  --version          display version number
+  --verbose, -v      display verbose output
+  --dry-run, -r      don't apply targets
+  --ssh SSH_TARGET   Execute on remote machine via SSH
+"""
+
+
+def print_help() -> None:
+    print(HELP, end="")
+
+
+def arg_error(message: str) -> None:
+    print(HELP.splitlines()[0], file=sys.stderr)
+    print(f"blarg: error: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+# hand-rolled instead of argparse, which costs more to import than the rest of
+# blarg's per-target work combined.
+FLAG_OPTIONS = {
+    "--dump-src": "dump_src",
+    "-d": "dump_src",
+    "--version": "version",
+    "--verbose": "verbose",
+    "-v": "verbose",
+    "--dry-run": "dry_run",
+    "-r": "dry_run",
+}
+
+
+def parse_args() -> CliArgs:
+    script_path: str | None = None
+    options = {"dump_src": False, "version": False, "verbose": False, "dry_run": False}
+    ssh: str | None = None
+
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print_help()
+            sys.exit(0)
+        elif arg == "--ssh":
+            i += 1
+            if i >= len(argv):
+                arg_error("argument --ssh: expected one argument")
+            ssh = argv[i]
+        elif arg.startswith("--ssh="):
+            ssh = arg[len("--ssh=") :]
+        elif arg in FLAG_OPTIONS:
+            options[FLAG_OPTIONS[arg]] = True
+        elif arg.startswith("-") and arg != "-":
+            arg_error(f"unrecognized argument: {arg}")
+        else:
+            if script_path is not None:
+                arg_error(f"unrecognized argument: {arg}")
+            script_path = arg
+        i += 1
+
+    return CliArgs(
+        script_path,
+        options["dump_src"],
+        options["version"],
+        options["verbose"],
+        options["dry_run"],
+        ssh,
+    )
+
+
+def list_dir_if_exists(dir_path: str) -> list[str]:
+    try:
+        return sorted(
+            os.path.realpath(os.path.join(dir_path, name))
+            for name in os.listdir(dir_path)
+            if not os.path.isdir(os.path.join(dir_path, name))
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def read_text(path: str) -> str:
+    with open(path, encoding="utf8") as f:
+        return f.read()
+
+
+def generate_script(module_root_dir: str, script_path: str) -> str:
+    script = f"# {script_path}\n" + read_text(script_path)
+    script_parts = [STDLIB]
+
+    lib_d_dir = os.path.join(module_root_dir, "lib.d")
+    for file in list_dir_if_exists(lib_d_dir):
+        if not file.endswith(".sh") and not file.endswith(".bash"):
+            continue
+        script_parts.append(f"# {file}\n{read_text(file)}\n")
+
+    return "".join(script_parts + [BASE, script, EXECUTOR]).lstrip()
+
+
+def rmtree_if_exists(path: str):
+    if os.path.exists(path):
+        from shutil import rmtree
+
+        rmtree(path)
+
+
+class ExternalModule:
+    def __init__(self, module_id: str, location: str, ref: str):
+        self.id = module_id
+        self.location = location
+        self.ref = ref
+
+    def init(self, working_dir: str) -> str:
+        import re
+        import shutil
+        import subprocess
+        from pathlib import Path  # cold path: only needed for home-dir URI
+
+        # `self.ref` could have some dangerous characters in it for file paths. let's
+        # use an allowlist of known-safe characters, and replace everything else with
+        # an underscore.
+        #
+        # if this ever gets ported to work on Windows, it needs to be adapted to account
+        # for reserved file names as well.
+        ALLOWED_REF_DIR_CHARS = set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-0123456789"
+        )
+        sanitized_ref_chars: list[str] = []
+        for ch in self.ref:
+            if ch in ALLOWED_REF_DIR_CHARS:
+                sanitized_ref_chars.append(ch)
+            else:
+                sanitized_ref_chars.append("_")
+        ref_dir_name = "".join(sanitized_ref_chars)
+
+        module_dir = os.path.join(
+            working_dir, ".blarg", "modules", self.id, ref_dir_name
+        )
+
+        if not os.path.exists(module_dir):
+            temp_dir = module_dir + ".tmp"
+            rmtree_if_exists(temp_dir)
+            os.makedirs(temp_dir)
+            source_dir = re.sub("^file://~", Path.home().as_uri(), self.location)
+
+            try:
+                subprocess.run(
+                    [
+                        "git",
+                        "clone",
+                        "--depth",
+                        "1",
+                        "--branch",
+                        self.ref,
+                        source_dir,
+                        temp_dir,
+                    ],
+                    check=True,
+                )
+                # backward-compat: can use `temp_dir.move()` if we drop support for
+                # python 3.7 and 3.8.
+                shutil.move(temp_dir, module_dir)
+            except:
+                rmtree_if_exists(module_dir)
+                rmtree_if_exists(temp_dir)
+                raise
+        return module_dir
+
+
+class BlargConfig:
+    def __init__(self, modules: list[ExternalModule]):
+        self.modules = modules
+
+
+def parse_config(config_path: str) -> BlargConfig:
+    if not os.path.exists(config_path):
+        # ConfigParser.read() silently ignores a missing file, which simply
+        # means there are no external modules.
+        return BlargConfig([])
+
+    from configparser import ConfigParser
+
+    ALLOWED_MODULE_NAME_CHARS = set("abcdefghijklmnopqrstuvwxyz_0123456789")
+    config = ConfigParser()
+    config.read(config_path)
+
+    modules: list[ExternalModule] = []
+    section: str
+    for section in config.sections():
+        (_, _, module_id) = section.partition("module.")
+        if module_id == "":
+            continue
+
+        if len(set(module_id).difference(ALLOWED_MODULE_NAME_CHARS)) > 0:
+            raise ValueError(
+                f"Invalid module ID: `{module_id}`. Module IDs can only contain lowercase characters, underscores, and numbers."
+            )
+
+        modules.append(
+            ExternalModule(
+                module_id,
+                config[section]["location"],
+                config[section]["ref"],
+            )
+        )
+    return BlargConfig(modules)
+
+
+class SSHProcess:
+    def __init__(self, remote_target: str, env: dict[str, str]):
+        self._remote_target = remote_target
+
+        local_control_dir = os.path.join(env.get("TMPDIR", "/tmp"), "blarg-ssh")
+        os.makedirs(local_control_dir, exist_ok=True)
+
+        self._ssh_options = [
+            "-o",
+            f"ControlPath={local_control_dir}/%C",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=10",
+        ]
+
+    def start(
+        self,
+        remote_command: str,
+        pty: bool = False,
+    ):
+        import subprocess
+
+        full_command = self._build_ssh_command(remote_command, pty)
+        return subprocess.Popen(full_command)
+
+    def send_data(self, remote_command: str, data):
+        import subprocess
+
+        full_command = self._build_ssh_command(remote_command)
+        return subprocess.Popen(full_command, stdin=data)
+
+    def _build_ssh_command(self, remote_command: str, pty: bool = False) -> list[str]:
+        import shlex
+
+        base = ["ssh", "-t"] if pty else ["ssh"]
+        # the remote user's login shell may not be POSIX-compatible (e.g. fish), and
+        # our command strings rely on POSIX syntax (`${VAR:-default}`, `VAR=value cmd`).
+        # always invoke bash explicitly: the login shell only has to understand
+        # `bash -c '<quoted string>'`, which any shell can parse.
+        bash_command = f"bash -c {shlex.quote(remote_command)}"
+        return base + self._ssh_options + [self._remote_target, bash_command]
+
+
+def fatal_exit_code(message: str) -> int:
+    print(f"FATAL: {message}", file=sys.stderr)
+    return 1
+
+
+def encode_running_targets(paths: list[str]) -> str:
+    return ":".join(paths)
+
+
+def decode_running_targets(raw: str) -> list[str]:
+    return raw.split(":") if raw else []
+
+
+def check_target_path(resolved_path: str) -> int | None:
+    if ":" in resolved_path:
+        return fatal_exit_code(f"Target path may not contain a colon: {resolved_path}")
+    return None
+
+
+def execute_remote(
+    ssh_target: str,
+    working_dir: str,
+    script_path: str,
+    env: dict[str, str],
+    verbose: bool,
+    dry_run: bool,
+) -> int:
+    import secrets
+    import shlex
+    import shutil
+    import subprocess
+
+    resolved_script_path = os.path.realpath(script_path)
+    resolved_working_dir = os.path.realpath(working_dir)
+    path_error = check_target_path(resolved_script_path)
+    if path_error is not None:
+        return path_error
+    if not resolved_script_path.startswith(resolved_working_dir):
+        return fatal_exit_code(
+            f"Target path {script_path} is outside the project directory {working_dir}"
+        )
+
+    if shutil.which("ssh") is None:
+        return fatal_exit_code("ssh not found")
+
+    if shutil.which("tar") is None:
+        return fatal_exit_code("tar not found")
+
+    forwarded_args = []
+    if verbose:
+        forwarded_args.append("--verbose")
+    if dry_run:
+        forwarded_args.append("--dry-run")
+    forwarded_args.append(shlex.quote(script_path))
+
+    # Copy blarg script to local .blarg/bin for inclusion in tar
+    local_blarg_bin = os.path.join(working_dir, ".blarg", "bin")
+    os.makedirs(local_blarg_bin, exist_ok=True)
+    local_blarg_path = os.path.join(local_blarg_bin, "blarg")
+
+    try:
+        shutil.copy2(os.path.realpath(__file__), local_blarg_path)
+    except Exception as e:  # noqa BLE001 -- we are exiting the program
+        return fatal_exit_code(f"Failed to copy blarg script locally: {e}")
+
+    ssh = SSHProcess(ssh_target, env)
+
+    # temp dir string intentionally unresolved, expecting the remote bash process to
+    # handle variable expansion etc.
+    #
+    # safe since i control all the inputs, and shell variable expansion should handle
+    # any craziness that might be hiding in TMPDIR env variable.
+    remote_temp_dir = f'"${{TMPDIR:-/tmp}}/blarg-{secrets.token_urlsafe(6)}"'
+
+    try:
+        # mode 700 equivalent to `u=rwx,g=,o=`
+        mkdir_status = ssh.start(f"mkdir -m 700 -p {remote_temp_dir}").wait()
+        if mkdir_status != 0:
+            return fatal_exit_code(f"ssh exited with code {mkdir_status}")
+    except Exception as e:  # noqa BLE001 -- we are exiting the program
+        return fatal_exit_code(f"Failed to connect to remote: {e}")
+
+    # Stream project to remote via tar over SSH
+    local_tar_bundle_cmd = [
+        "tar",
+        "czf",
+        "-",
+        "--exclude=.git",
+        "-C",
+        resolved_working_dir,
+        ".",
+    ]
+
+    try:
+        tar_proc = subprocess.Popen(
+            local_tar_bundle_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+
+        if tar_proc.stdout is None:
+            raise ValueError("tar stdout should not be None.")
+
+        ssh_proc = ssh.send_data(
+            f"tar xzf - -C {remote_temp_dir}",
+            tar_proc.stdout,
+        )
+
+        tar_proc.stdout.close()
+        tar_exit_code = tar_proc.wait()
+
+        _, ssh_error = ssh_proc.communicate()
+
+        if tar_exit_code != 0:
+            return fatal_exit_code(f"tar failed with exit code {tar_exit_code}")
+
+        if ssh_proc.returncode != 0:
+            error_msg = ssh_error.decode() if ssh_error else "unknown error"
+            return fatal_exit_code(f"SSH extraction failed: {error_msg}")
+
+    except Exception as e:  # noqa BLE001 -- we are exiting the program
+        return fatal_exit_code(f"Failed to upload local project to remote: {e}")
+
+    remote_working_dir = remote_temp_dir
+    blarg_cmd = f'PATH="{remote_temp_dir}/.blarg/bin:${{PATH}}" blarg {" ".join(forwarded_args)}'
+
+    try:
+        return ssh.start(f"cd {remote_working_dir} && {blarg_cmd}", pty=True).wait()
+    except Exception as e:  # noqa BLE001 -- we are exiting the program
+        return fatal_exit_code(f"SSH command `{blarg_cmd}` failed: {e}")
+    finally:
+        try:
+            ssh.start(f"rm -rf {remote_temp_dir}").wait()
+        except Exception as e:  # noqa BLE001 -- we are exiting the program
+            print(f"WARNING: cleanup command failed with {e}", file=sys.stderr)
+
+
+def execute_local(
+    working_dir: str,
+    module_dir: str,
+    script_path: str,
+    env: dict[str, str],
+    verbose: bool,
+    dry_run: bool,
+):
+    resolved_path = os.path.realpath(script_path)
+    path_error = check_target_path(resolved_path)
+    if path_error is not None:
+        return path_error
+    env["BLARG_TARGET_PATH"] = resolved_path
+
+    if verbose:
+        env["BLARG_VERBOSE"] = str(verbose)
+
+    if not env.get("BLARG_CWD"):
+        env["BLARG_CWD"] = working_dir
+
+    targets_dir = env.get("BLARG_TARGETS_DIR")
+    if targets_dir:
+        targets_dir = os.path.realpath(targets_dir)
+    else:
+        targets_dir = os.path.join(os.getcwd(), "targets")
+        env["BLARG_TARGETS_DIR"] = targets_dir
+
+    dry_run = dry_run or "BLARG_DRY_RUN" in env
+    if dry_run:
+        env["BLARG_DRY_RUN"] = str(dry_run)
+
+    indent = env.get("BLARG_INDENT")
+    if indent is None:
+        indent = "--> "
+    else:
+        indent = f" {indent}"
+    env["BLARG_INDENT"] = indent
+
+    target_name = os.path.splitext(resolved_path)[0]
+    _, _, shortened_target_name = target_name.partition(f"{targets_dir}/")
+    env["BLARG_TARGET_NAME"] = shortened_target_name or target_name
+
+    running_targets_unparsed = env.get("BLARG_RUNNING_TARGETS")
+    if running_targets_unparsed:
+        running_targets = decode_running_targets(running_targets_unparsed)
+    else:
+        running_targets = []
+
+    if str(resolved_path) in running_targets:
+        stack_seperator = "\n-> "
+        return fatal_exit_code(
+            f"Circular dependency detected at `{resolved_path}`:\n"
+            f"{stack_seperator.join(running_targets)}"
+            f"{stack_seperator}{resolved_path}"
+        )
+
+    running_targets.append(str(resolved_path))
+    env["BLARG_RUNNING_TARGETS"] = encode_running_targets(running_targets)
+
+    temp_dir_path = env.get("BLARG_RUN_DIR")
+    if temp_dir_path:
+        temp_dir = None  # a different blarg process is managing this directory
+    else:
+        from tempfile import TemporaryDirectory
+
+        temp_dir = TemporaryDirectory()
+        temp_dir_path = temp_dir.name
+        env["BLARG_RUN_DIR"] = temp_dir_path
+        os.mkdir(f"{temp_dir_path}/.target-markers")
+
+    # the marker filename only needs to uniquely identify the target file within
+    # this run; the file's device + inode do that.
+    target_stat = os.stat(resolved_path)
+    marker_name = f"{target_stat.st_dev:x}-{target_stat.st_ino:x}"
+    marker_file = os.path.join(temp_dir_path, ".target-markers", marker_name)
+    if os.path.exists(marker_file):
+        return 0  # this target has already been run
+    else:
+        open(marker_file, "w").close()
+
+    script = generate_script(module_dir, script_path)
+
+    if temp_dir is not None:
+        # this process created the run dir, so it stays around to clean it up
+        # after the target finishes.
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["bash", "-Euo", "pipefail"],
+                input=script,
+                encoding="utf8",
+                env=env,
+            )
+        finally:
+            temp_dir.cleanup()
+        return result.returncode
+
+    # every other target process replaces itself with bash: one less process
+    # spawn and no need to import subprocess. the process that created the run
+    # dir is still waiting and will clean it up.
+    scripts_dir = os.path.join(temp_dir_path, ".scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    script_file = os.path.join(scripts_dir, f"{marker_name}.bash")
+    with open(script_file, "w", encoding="utf8") as f:
+        f.write(script)
+
+    # ensure stdin for the process is just an EOF
+    dev_null = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(dev_null, 0)
+    os.close(dev_null)
+
+    os.execvp("bash", ["bash", "-Euo", "pipefail", script_file])
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.version:
+        print(f"blarg version {VERSION}")
+        return 0
+
+    if args.ssh and args.dump_src:
+        return fatal_exit_code("--ssh and --dump-src are mutually exclusive")
+
+    if not args.script_path:
+        print_help()
+        return 0
+
+    script_path = args.script_path
+    if os.path.isdir(script_path):
+        script_path = os.path.join(script_path, "main.bash")
+
+    env = os.environ
+    working_dir = os.getcwd()
+
+    module_dir_str = env.get("BLARG_MODULE_DIR")
+    if module_dir_str is None:  # TODO: document difference between module dir and CWD
+        module_dir = working_dir
+        env["BLARG_MODULE_DIR"] = module_dir
+    else:
+        module_dir = module_dir_str
+
+    if args.dump_src:
+        print(generate_script(module_dir, script_path))
+        return 0
+
+    config_path = os.path.join(module_dir, "blarg.conf")
+    if env.get("BLARG_MODULE_CONFIG_PATH") != config_path:
+        config = parse_config(config_path)
+        for module in config.modules:
+            external_module_dir = module.init(working_dir)
+            env[f"BLARG_MODULE_{module.id}"] = str(external_module_dir)
+        env["BLARG_MODULE_CONFIG_PATH"] = str(config_path)
+
+    is_verbose = args.verbose or "BLARG_VERBOSE" in env
+
+    if args.ssh:
+        return execute_remote(
+            args.ssh,
+            working_dir,
+            script_path,
+            env,
+            is_verbose,
+            args.dry_run,
+        )
+    else:
+        return execute_local(
+            working_dir,
+            module_dir,
+            script_path,
+            env,
+            is_verbose,
+            args.dry_run,
+        )
+
+
+if __name__ == "__main__":
+    exit_code = main()
+    sys.exit(exit_code)

@@ -1,5 +1,12 @@
 # shellcheck shell=bash
 strict_env
 PATH_add bin
+export ENVRC_LOADED=1
 
 export SSH_DEST=user@tailscale-hostname
+export INTERNAL_APEX_DOMAIN=TODO
+
+# putting secrets in envrc because we don't want bitwarden access inside the proxy VM.
+# the VM host is more trusted, will handle the bitwarden access.
+export PORKBUN_API_KEY=TODO
+export PORKBUN_API_SECRET_KEY=TODO

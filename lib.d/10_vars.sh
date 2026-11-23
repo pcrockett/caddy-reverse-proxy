@@ -9,5 +9,6 @@ export REPO_BIN_DIR="${BLARG_MODULE_DIR}/bin"
 if [ "${ENVRC_LOADED:-}" == "" ]; then
   strict_env() { :; }
   PATH_add() { :; }
+  # shellcheck source=.envrc
   source "${BLARG_MODULE_DIR}/.envrc"
 fi

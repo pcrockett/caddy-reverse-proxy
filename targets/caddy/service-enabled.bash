@@ -1,6 +1,6 @@
 #!/usr/bin/env blarg
 
-depends_on caddyfile-placed user-created env-configured
+depends_on caddyfile-placed user-created env-configured installed
 
 UNIT="caddy.service"
 

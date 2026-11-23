@@ -10,7 +10,6 @@ targets/main.bash` to apply all targets.
 - **blarg** (in `bin/blarg`) is the target-based Bash config management tool. Entry
   point: `targets/main.bash`.
 - Targets are in `targets/` directory, organized in subdirectories by category.
-- External targets from `pcrockett/blarg-targets@v0.5.0` (see `blarg.conf`).
 - Templates for new targets in `templates/`.
 
 ## Environment

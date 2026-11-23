@@ -24,3 +24,11 @@ update-blarg:
 # Update this repo from its copier template
 update-template:
     copier update --skip-answered
+
+# Build customer version of Caddy with Porkbun extension
+build-caddy:
+    mkdir -p artifact
+    # v0.3.1
+    xcaddy build \
+        --with github.com/caddy-dns/porkbun@ce0d8d12ed133b8438c28863f6bf3c63bf83a279 \
+        --output artifact/caddy

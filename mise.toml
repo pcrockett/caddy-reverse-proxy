@@ -1,6 +1,8 @@
 [tools]
+"github:caddyserver/xcaddy" = "latest"
 "github:stepchowfun/tagref" = "latest"
 dprint = "latest"
+go = "latest"
 jactionlint = "latest"
 just = "latest"
 pre-commit = "latest"

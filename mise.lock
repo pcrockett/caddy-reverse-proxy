@@ -19,6 +19,22 @@ url = "https://github.com/dprint/dprint/releases/download/0.64.3/dprint-x86_64-u
 url_api = "https://api.github.com/repos/dprint/dprint/releases/assets/667629164"
 provenance = "github-attestations"
 
+[[tools."github:caddyserver/xcaddy"]]
+version = "0.4.7"
+backend = "github:caddyserver/xcaddy"
+specifiers = ["latest"]
+
+[tools."github:caddyserver/xcaddy"."platforms.linux-x64"]
+checksum = "sha256:e6d2882fb751b9697cdb73b0da8b8a7393f0d7f2cb47afa79a23982c4c61d2d4"
+url = "https://github.com/caddyserver/xcaddy/releases/download/v0.4.7/xcaddy_0.4.7_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/caddyserver/xcaddy/releases/assets/518297204"
+
+[tools."github:caddyserver/xcaddy"."platforms.linux-x64-musl"]
+checksum = "sha256:e6d2882fb751b9697cdb73b0da8b8a7393f0d7f2cb47afa79a23982c4c61d2d4"
+checksum_source = "mise-versions"
+url = "https://github.com/caddyserver/xcaddy/releases/download/v0.4.7/xcaddy_0.4.7_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/caddyserver/xcaddy/releases/assets/518297204"
+
 [[tools."github:stepchowfun/tagref"]]
 version = "1.14.0"
 backend = "github:stepchowfun/tagref"
@@ -35,6 +51,19 @@ checksum = "sha256:8889b8ce15c4e6dbafe36660723602e3a2a4ba0c5b7ffbd7b9167451fceef
 checksum_source = "mise-versions"
 url = "https://github.com/stepchowfun/tagref/releases/download/v1.14.0/tagref-x86_64-unknown-linux-musl"
 url_api = "https://api.github.com/repos/stepchowfun/tagref/releases/assets/581362838"
+
+[[tools.go]]
+version = "1.27.4"
+backend = "core:go"
+specifiers = ["latest"]
+
+[tools.go."platforms.linux-x64"]
+checksum = "sha256:7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840"
+url = "https://dl.google.com/go/go1.27.4.linux-amd64.tar.gz"
+
+[tools.go."platforms.linux-x64-musl"]
+checksum = "sha256:7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840"
+url = "https://dl.google.com/go/go1.27.4.linux-amd64.tar.gz"
 
 [[tools.jactionlint]]
 version = "2.5.0"

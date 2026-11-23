@@ -29,4 +29,7 @@ jobs:
           key: pre-commit-hooks|${{ hashFiles('.pre-commit-config.yaml') }}
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b  # v5.2.7
       - name: lint
-        run: just lint
+        run: |
+          # we source .envrc, which is gitignored
+          cp .envrc.template .envrc
+          just lint
